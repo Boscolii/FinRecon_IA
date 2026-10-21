@@ -16,6 +16,11 @@ LOG_PATH = Path(os.environ.get("CONCILIACAO_LOG", "logs/audit.jsonl"))
 RUNS_DIR = Path(os.environ.get("CONCILIACAO_RUNS", "runs"))
 MAX_ROWS = 500
 PREVIEW_DIVERGENCES = 25
+MAX_CSV_BYTES = 10 * 1024 * 1024
+MAX_CSV_LINES = 100_000
+MAX_REPORT_ITEMS = 50
+RULES_VERSION = "2026-10-21.2"
+RUN_FORMAT_VERSION = 2
 
 mcp = FastMCP("FinRecon AI")
 
@@ -43,10 +48,28 @@ def audited(fn):
 
 
 def _safe_csv(name):
-    path = (DATA_DIR / name).resolve()
-    if DATA_DIR.resolve() not in path.parents or path.suffix.lower() != ".csv" or not path.is_file():
+    if not isinstance(name, str) or Path(name).name != name:
+        raise ValueError("arquivo csv nao permitido")
+    requested = DATA_DIR / name
+    data_dir = DATA_DIR.resolve()
+    if requested.is_symlink():
+        raise ValueError("arquivo csv nao permitido: links simbolicos nao sao aceitos")
+    path = requested.resolve()
+    if path.parent != data_dir or path.suffix.lower() != ".csv" or not path.is_file():
         raise ValueError(f"arquivo csv nao permitido ou inexistente: {name}")
+    if path.stat().st_size > MAX_CSV_BYTES:
+        raise ValueError(f"arquivo csv excede o tamanho maximo de {MAX_CSV_BYTES} bytes")
+    with path.open("rb") as fh:
+        line_count = sum(chunk.count(b"\n") for chunk in iter(lambda: fh.read(1024 * 1024), b""))
+    if line_count > MAX_CSV_LINES:
+        raise ValueError(f"arquivo csv excede o limite de {MAX_CSV_LINES} linhas")
     return path
+
+
+def _limit(value, name, maximum):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError(f"{name} deve ser inteiro entre 1 e {maximum}")
+    return value
 
 
 def _brl(cents):
@@ -56,7 +79,7 @@ def _brl(cents):
 
 
 def _run_path(run_id):
-    if not run_id.isalnum():
+    if not isinstance(run_id, str) or len(run_id) != 64 or any(char not in "0123456789abcdef" for char in run_id):
         raise ValueError("execucao_id invalido")
     return RUNS_DIR / f"{run_id}.json"
 
@@ -86,15 +109,16 @@ def listar_schema() -> dict:
 def consultar_transacoes(data_inicio: str, data_fim: str, limite: int = 50) -> dict:
     start, _ = engine.day_window(data_inicio)
     _, end = engine.day_window(data_fim)
-    limit = max(1, min(limite, MAX_ROWS))
-    conn = engine.connect_readonly(DB_PATH)
+    if start >= end:
+        raise ValueError("data_inicio deve ser anterior ou igual a data_fim")
+    limit = _limit(limite, "limite", MAX_ROWS)
     params = (start.isoformat(), end.isoformat())
-    total = conn.execute("SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM transactions WHERE occurred_at >= ? AND occurred_at < ?", params).fetchone()
-    rows = conn.execute(
-        "SELECT nsu, merchant, amount_cents, occurred_at, status, card_last4 FROM transactions WHERE occurred_at >= ? AND occurred_at < ? ORDER BY id LIMIT ?",
-        (*params, limit),
-    ).fetchall()
-    conn.close()
+    conn = engine.connect_readonly(DB_PATH)
+    try:
+        total = conn.execute("SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM transactions WHERE occurred_at >= ? AND occurred_at < ?", params).fetchone()
+        rows = conn.execute("SELECT nsu, merchant, amount_cents, occurred_at, status, card_last4 FROM transactions WHERE occurred_at >= ? AND occurred_at < ? ORDER BY id LIMIT ?", (*params, limit)).fetchall()
+    finally:
+        conn.close()
     keys = ("nsu", "merchant", "amount_cents", "occurred_at", "status", "card_last4")
     return {"total": total[0], "soma_centavos": total[1], "retornadas": len(rows), "transacoes": [dict(zip(keys, r)) for r in rows]}
 
@@ -103,8 +127,8 @@ def consultar_transacoes(data_inicio: str, data_fim: str, limite: int = 50) -> d
 @audited
 def ler_csv(arquivo: str, limite: int = 20) -> dict:
     rows = engine.load_csv(_safe_csv(arquivo))
-    limit = max(1, min(limite, MAX_ROWS))
-    return {"total": len(rows), "soma_centavos": sum(r.amount_cents for r in rows), "amostra": [r.to_dict() for r in rows[:limit]]}
+    limit = _limit(limite, "limite", MAX_ROWS)
+    return {"total": len(rows), "soma_centavos": sum(r.amount_cents for r in rows), "retornadas": min(len(rows), limit), "truncado": len(rows) > limit, "amostra": [r.to_dict() for r in rows[:limit]]}
 
 
 @mcp.tool()
@@ -113,17 +137,20 @@ def conciliar(arquivo_csv: str, data: str, tolerancia_centavos: int = 0, toleran
     path = _safe_csv(arquivo_csv)
     start, end = engine.day_window(data, margem_dias)
     conn = engine.connect_readonly(DB_PATH)
-    bank = engine.load_bank(conn, start, end)
-    conn.close()
+    try:
+        bank = engine.load_bank(conn, start, end)
+    finally:
+        conn.close()
     csv_rows = engine.load_csv(path, start, end)
     result = engine.reconcile(bank, csv_rows, tolerancia_centavos, tolerancia_minutos)
     digest = hashlib.sha256()
     digest.update(path.read_bytes())
-    digest.update(json.dumps([data, tolerancia_centavos, tolerancia_minutos, margem_dias, [t.to_dict() for t in bank]], sort_keys=True).encode())
-    run_id = digest.hexdigest()[:12]
+    digest.update(json.dumps({"rules_version": RULES_VERSION, "data": data, "tolerancia_centavos": tolerancia_centavos, "tolerancia_minutos": tolerancia_minutos, "margem_dias": margem_dias, "bank": [t.to_dict() for t in bank]}, sort_keys=True).encode())
+    run_id = digest.hexdigest()
     run = {
         "execucao_id": run_id,
         "parametros": {"arquivo_csv": arquivo_csv, "data": data, "tolerancia_centavos": tolerancia_centavos, "tolerancia_minutos": tolerancia_minutos, "margem_dias": margem_dias},
+        "metadata": {"run_format_version": RUN_FORMAT_VERSION, "rules_version": RULES_VERSION, "csv_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bank_records": len(bank)},
         "summary": result["summary"],
         "divergences": [d.to_dict() for d in result["divergences"]],
     }
@@ -135,15 +162,19 @@ def conciliar(arquivo_csv: str, data: str, tolerancia_centavos: int = 0, toleran
 
 @mcp.tool()
 @audited
-def detalhar_divergencia(execucao_id: str, nsu: str, tipo: str = "") -> list:
+def detalhar_divergencia(execucao_id: str, finding_id: str) -> dict:
     run = _load_run(execucao_id)
-    return [d for d in run["divergences"] if d["nsu"] == nsu and (not tipo or d["type"] == tipo)]
+    matches = [d for d in run["divergences"] if d["finding_id"] == finding_id]
+    if len(matches) != 1:
+        raise ValueError("divergencia nao encontrada")
+    return matches[0]
 
 
 @mcp.tool()
 @audited
 def gerar_relatorio(execucao_id: str, max_por_tipo: int = 10) -> str:
     run = _load_run(execucao_id)
+    max_por_tipo = _limit(max_por_tipo, "max_por_tipo", MAX_REPORT_ITEMS)
     s, p = run["summary"], run["parametros"]
     lines = [
         f"# Relatorio de conciliacao {execucao_id}",

@@ -41,7 +41,7 @@ Pedido de exemplo: "Concilie o arquivo bandeira.csv do dia 2026-10-19 com o banc
 | `consultar_transacoes` | Consulta parametrizada somente leitura, com limite de linhas |
 | `ler_csv` | Carrega e normaliza o CSV (valor, fuso, status) |
 | `conciliar` | Executa o matching e classifica as divergências |
-| `detalhar_divergencia` | Evidência completa de uma divergência |
+| `detalhar_divergencia` | Evidência completa de uma divergência, identificada por `finding_id` |
 | `gerar_relatorio` | Relatório em Markdown de uma execução |
 
 ## Matching
@@ -57,9 +57,10 @@ Tipos: `value_mismatch`, `only_in_bank`, `only_in_csv`, `duplicate`, `date_misma
 
 - Banco aberto com `mode=ro`; não existe ferramenta de escrita.
 - Nenhum SQL livre vindo do LLM: só consultas parametrizadas.
-- CSV só é lido dentro de `data/` e com extensão `.csv`.
+- CSV só é lido diretamente dentro de `data/`, com extensão `.csv`; caminhos relativos, subpastas e links simbólicos são bloqueados.
+- Cada CSV é limitado a 10 MiB e 100.000 linhas. Pré-visualizações e consultas têm limite explícito de 500 registros.
 - Cada chamada gera uma linha em `logs/audit.jsonl` (parâmetros, status, duração).
-- `execucao_id` é um hash dos inputs: o mesmo input gera a mesma execução, salva em `runs/`.
+- `execucao_id` usa o hash SHA-256 completo do CSV, registros do banco, parâmetros e versão das regras; a execução salva metadados de reprodução em `runs/`.
 
 ## Contrato do CSV
 
