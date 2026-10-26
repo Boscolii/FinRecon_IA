@@ -17,6 +17,21 @@ pytest
 python -m conciliacao.server
 ```
 
+## Agente de IA
+
+O agente é um cliente de linha de comando que inicia o servidor MCP localmente, apresenta apenas as ferramentas permitidas ao modelo e devolve os resultados determinísticos para explicação. Ele não recebe acesso direto ao SQLite, ao sistema de arquivos ou a SQL livre.
+
+Crie um arquivo `.env` a partir de `.env.example` e configure o provedor. O padrão é Gemini, com `GEMINI_API_KEY`, modelo `gemini-3.5-flash-lite` e `GEMINI_THINKING_LEVEL=minimal`, perfil rápido para perguntas operacionais; também são aceitos `openai`, com `OPENAI_API_KEY`, e qualquer endpoint que implemente o padrão OpenAI Chat Completions/tool calling, por meio de `LLM_PROVIDER=openai_compatible`, `LLM_API_KEY` e `LLM_BASE_URL`. Nunca versione uma chave real. `FINRECON_MODEL` é opcional para Gemini e OpenAI, mas obrigatório para um endpoint compatível.
+
+No PowerShell:
+
+```powershell
+$env:GEMINI_API_KEY = "sua_chave"
+python -m conciliacao.agent "Concilie o arquivo bandeira.csv do dia 2026-10-19 e explique as divergencias."
+```
+
+O agente pode chamar somente `listar_schema`, `consultar_transacoes`, `ler_csv`, `conciliar`, `detalhar_divergencia` e `gerar_relatorio`. O limite é oito rodadas de ferramentas por pergunta. Em caso de erro de ferramenta, ele recebe a falha estruturada e deve informar a limitação, sem inventar um resultado. Um provedor que não ofereça tool calling precisa de um adaptador próprio e não deve ser usado para a demonstração do agente.
+
 Cliente MCP (exemplo para Claude Desktop):
 
 ```json
