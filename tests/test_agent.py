@@ -1,11 +1,12 @@
 import asyncio
 import json
 import copy
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
-from conciliacao.agent import FinReconAgent, McpTools, ToolExecutionError, build_provider, tools_for_openai
+from conciliacao.agent import FinReconAgent, McpTools, TokenUsage, ToolExecutionError, build_provider, tools_for_openai
 from conciliacao.generator import generate
 
 
@@ -83,8 +84,8 @@ def test_gemini_tool_result_is_returned_to_model():
         def create(self, model, contents, tools):
             self.requests.append(copy.deepcopy(contents))
             if len(self.requests) == 1:
-                return {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "conciliar", "args": {"arquivo_csv": "bandeira.csv"}, "id": "call-1"}, "thoughtSignature": "signature"}]}}]}
-            return {"candidates": [{"content": {"parts": [{"text": "Foram encontradas 2 divergencias."}]}}]}
+                return {"usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10, "thoughtsTokenCount": 5, "totalTokenCount": 115}, "candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "conciliar", "args": {"arquivo_csv": "bandeira.csv"}, "id": "call-1"}, "thoughtSignature": "signature"}]}}]}
+            return {"usageMetadata": {"promptTokenCount": 150, "candidatesTokenCount": 20, "totalTokenCount": 170}, "candidates": [{"content": {"parts": [{"text": "Foram encontradas 2 divergencias."}]}}]}
 
     client = FakeGemini()
     result = asyncio.run(FinReconAgent(client, FakeTools(), model="test-model").run("Concilie bandeira.csv"))
@@ -93,6 +94,28 @@ def test_gemini_tool_result_is_returned_to_model():
     output = client.requests[1][-1]["parts"][0]["functionResponse"]
     assert output["id"] == "call-1"
     assert output["response"]["result"]["summary"]["divergence_count"] == 2
+    assert result.usage.model_calls == 2
+    assert result.usage.input_tokens == 250
+    assert result.usage.output_tokens == 30
+    assert result.usage.thinking_tokens == 5
+    assert result.usage.total_tokens == 285
+    assert result.usage.gemini_standard_uncached_usd("gemini-3.5-flash-lite") == Decimal("0.0001625")
+
+
+def test_usage_missing_from_one_model_call_is_not_priced_as_zero():
+    usage = TokenUsage()
+    usage.add_gemini({"promptTokenCount": 100, "totalTokenCount": 100})
+    usage.add_gemini(None)
+    assert usage.reported_calls == 1 and usage.model_calls == 2
+    assert not usage.complete
+    assert usage.gemini_standard_uncached_usd("gemini-3.5-flash-lite") is None
+
+
+def test_openai_usage_is_counted_without_double_counting_reasoning():
+    usage = TokenUsage()
+    usage.add_openai(SimpleNamespace(prompt_tokens=50, completion_tokens=20, total_tokens=70, prompt_tokens_details=SimpleNamespace(cached_tokens=10)))
+    assert (usage.input_tokens, usage.output_tokens, usage.cached_tokens, usage.total_tokens) == (50, 20, 10, 70)
+    assert usage.complete
 
 
 def test_agent_uses_real_mcp_with_synthetic_data(tmp_path, monkeypatch):

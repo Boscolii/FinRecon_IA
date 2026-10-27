@@ -47,6 +47,8 @@ $env:GEMINI_API_KEY = "sua_chave"
 
 O agente pode chamar somente `listar_schema`, `consultar_transacoes`, `ler_csv`, `conciliar`, `detalhar_divergencia` e `gerar_relatorio`. O limite é oito rodadas de ferramentas por pergunta. Em caso de erro de ferramenta, ele recebe a falha estruturada e deve informar a limitação, sem inventar um resultado. Um provedor que não ofereça tool calling precisa de um adaptador próprio e não deve ser usado para a demonstração do agente.
 
+Ao finalizar, o agente mostra o uso de tokens informado pelo provedor e uma estimativa hipotética para o Gemini configurado, quando disponível. Veja [a análise de custos](docs/analise-custos.md) para preços, medições e limitações.
+
 Cliente MCP (exemplo para Claude Desktop):
 
 ```json

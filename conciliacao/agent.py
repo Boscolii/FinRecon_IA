@@ -8,6 +8,7 @@ import sys
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from mcp import ClientSession
@@ -28,6 +29,50 @@ class ToolExecutionError(RuntimeError):
     pass
 
 
+@dataclass
+class TokenUsage:
+    model_calls: int = 0
+    reported_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0
+    cached_tokens: int = 0
+    total_tokens: int = 0
+
+    def add_gemini(self, usage):
+        self.model_calls += 1
+        if not usage or not all(key in usage for key in ("promptTokenCount", "totalTokenCount")):
+            return
+        self.reported_calls += 1
+        self.input_tokens += usage["promptTokenCount"] + usage.get("toolUsePromptTokenCount", 0)
+        self.output_tokens += usage.get("candidatesTokenCount", 0)
+        self.thinking_tokens += usage.get("thoughtsTokenCount", 0)
+        self.cached_tokens += usage.get("cachedContentTokenCount", 0)
+        self.total_tokens += usage["totalTokenCount"]
+
+    def add_openai(self, usage):
+        self.model_calls += 1
+        if usage is None or any(getattr(usage, key, None) is None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+            return
+        self.reported_calls += 1
+        self.input_tokens += usage.prompt_tokens
+        self.output_tokens += usage.completion_tokens
+        details = getattr(usage, "prompt_tokens_details", None)
+        self.cached_tokens += getattr(details, "cached_tokens", 0) or 0
+        self.total_tokens += usage.total_tokens
+
+    @property
+    def complete(self):
+        return self.model_calls > 0 and self.reported_calls == self.model_calls
+
+    def gemini_standard_uncached_usd(self, model):
+        if not self.complete or model != "gemini-3.5-flash-lite":
+            return None
+        if self.total_tokens != self.input_tokens + self.output_tokens + self.thinking_tokens:
+            return None
+        return (Decimal(self.input_tokens) * Decimal("0.30") + Decimal(self.output_tokens + self.thinking_tokens) * Decimal("2.50")) / Decimal(1_000_000)
+
+
 @dataclass(frozen=True)
 class AgentResult:
     answer: str
@@ -35,6 +80,7 @@ class AgentResult:
     elapsed_ms: int
     model_ms: int
     mcp_ms: int
+    usage: TokenUsage
 
 
 class McpTools:
@@ -133,16 +179,18 @@ class FinReconAgent:
         tools = await tools_for_openai(self.tool_source)
         messages = [{"role": "system", "content": SYSTEM_INSTRUCTIONS}, {"role": "user", "content": user_message.strip()}]
         called = []
+        usage = TokenUsage()
         model_ms = 0
         mcp_ms = 0
         for _ in range(MAX_TOOL_ROUNDS):
             model_started = time.perf_counter()
             response = self.client.chat.completions.create(model=self.model, messages=messages, tools=tools)
+            usage.add_openai(getattr(response, "usage", None))
             model_ms += round((time.perf_counter() - model_started) * 1000)
             message = response.choices[0].message
             function_calls = message.tool_calls or []
             if not function_calls:
-                return AgentResult(message.content or "Nao foi possivel gerar uma resposta.", called, round((time.perf_counter() - started) * 1000), model_ms, mcp_ms)
+                return AgentResult(message.content or "Nao foi possivel gerar uma resposta.", called, round((time.perf_counter() - started) * 1000), model_ms, mcp_ms, usage)
             messages.append(message.model_dump(exclude_none=True))
             for call in function_calls:
                 called.append(call.function.name)
@@ -160,16 +208,18 @@ class FinReconAgent:
         tools = await tools_for_gemini(self.tool_source)
         contents = [{"role": "user", "parts": [{"text": user_message}]}]
         called, model_ms, mcp_ms = [], 0, 0
+        usage = TokenUsage()
         for _ in range(MAX_TOOL_ROUNDS):
             model_started = time.perf_counter()
             response = self.client.create(self.model, contents, tools)
+            usage.add_gemini(response.get("usageMetadata"))
             model_ms += round((time.perf_counter() - model_started) * 1000)
             candidate = response.get("candidates", [{}])[0]
             parts = candidate.get("content", {}).get("parts", [])
             function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
             if not function_calls:
                 answer = "".join(part.get("text", "") for part in parts).strip()
-                return AgentResult(answer or "Nao foi possivel gerar uma resposta.", called, round((time.perf_counter() - started) * 1000), model_ms, mcp_ms)
+                return AgentResult(answer or "Nao foi possivel gerar uma resposta.", called, round((time.perf_counter() - started) * 1000), model_ms, mcp_ms, usage)
             contents.append(candidate["content"])
             results = []
             for call in function_calls:
@@ -223,6 +273,18 @@ async def main_async(question, model, llm_client):
         result = await FinReconAgent(llm_client, tools, model).run(question)
     print(result.answer)
     print(f"\n[FinRecon AI: {len(result.tool_calls)} chamada(s) MCP | modelo: {result.model_ms} ms | MCP: {result.mcp_ms} ms | total: {result.elapsed_ms} ms]")
+    usage = result.usage
+    print(f"[Tokens: chamadas ao modelo: {usage.model_calls} | uso informado: {usage.reported_calls}/{usage.model_calls} | entrada: {usage.input_tokens} | saida: {usage.output_tokens} | raciocinio: {usage.thinking_tokens} | cache (incluido na entrada): {usage.cached_tokens} | total: {usage.total_tokens}]")
+    if not usage.complete:
+        print("[Uso incompleto ou indisponivel: os valores sao parciais; custo nao estimado.]")
+    elif getattr(llm_client, "kind", "") == "gemini_native":
+        estimate = usage.gemini_standard_uncached_usd(model)
+        if estimate is None:
+            print("[Custo nao estimado: modelo sem tabela configurada ou contagens nao reconciliadas.]")
+        else:
+            print(f"[Estimativa hipotetica Gemini pago padrao, sem desconto de cache: US$ {estimate:.8f} (tarifas de referencia: 27/10/2026); confira precos e cobranca reais.]")
+    else:
+        print("[Custo nao estimado para este provedor; consulte os precos e a fatura correspondentes.]")
 
 
 def main():
