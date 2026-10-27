@@ -162,6 +162,20 @@ def conciliar(arquivo_csv: str, data: str, tolerancia_centavos: int = 0, toleran
 
 @mcp.tool()
 @audited
+def listar_divergencias(execucao_id: str, inicio: int = 0, limite: int = 100) -> dict:
+    """Lista uma pagina de achados completos de uma execucao, sem omitir evidencias."""
+    if isinstance(inicio, bool) or not isinstance(inicio, int) or inicio < 0:
+        raise ValueError("inicio deve ser inteiro nao negativo")
+    limit = _limit(limite, "limite", 100)
+    divergences = _load_run(execucao_id)["divergences"]
+    items = divergences[inicio:inicio + limit]
+    next_start = inicio + len(items)
+    return {"total": len(divergences), "inicio": inicio, "divergencias": items,
+            "proximo_inicio": next_start if next_start < len(divergences) else None}
+
+
+@mcp.tool()
+@audited
 def detalhar_divergencia(execucao_id: str, finding_id: str) -> dict:
     run = _load_run(execucao_id)
     matches = [d for d in run["divergences"] if d["finding_id"] == finding_id]

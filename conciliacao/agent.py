@@ -16,7 +16,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from dotenv import load_dotenv
 import httpx
 
-ALLOWED_TOOLS = frozenset({"listar_schema", "consultar_transacoes", "ler_csv", "conciliar", "detalhar_divergencia", "gerar_relatorio"})
+ALLOWED_TOOLS = frozenset({"listar_schema", "consultar_transacoes", "ler_csv", "conciliar", "listar_divergencias", "detalhar_divergencia", "gerar_relatorio"})
 MAX_TOOL_ROUNDS = 8
 MCP_ENV_KEYS = ("CONCILIACAO_DB", "CONCILIACAO_DATA_DIR", "CONCILIACAO_LOG", "CONCILIACAO_RUNS")
 SYSTEM_INSTRUCTIONS = """Voce e o assistente do FinRecon AI. Use somente as ferramentas fornecidas para fatos financeiros.
@@ -158,6 +158,7 @@ class FinReconAgent:
         self.client = llm_client
         self.tool_source = tool_source
         self.model = model
+        self.executions = []
 
     async def execute_tool(self, name, raw_arguments):
         if name not in ALLOWED_TOOLS:
@@ -168,7 +169,12 @@ class FinReconAgent:
             raise ToolExecutionError(f"argumentos JSON invalidos para {name}") from exc
         if not isinstance(arguments, dict):
             raise ToolExecutionError(f"argumentos de {name} devem ser um objeto JSON")
-        return await self.tool_source.call(name, arguments)
+        result = await self.tool_source.call(name, arguments)
+        if name == "conciliar" and isinstance(result, dict) and isinstance(result.get("execucao_id"), str):
+            run_id = result["execucao_id"]
+            if run_id not in self.executions:
+                self.executions.append(run_id)
+        return result
 
     async def run(self, user_message):
         if not user_message or not user_message.strip():
@@ -267,11 +273,76 @@ def build_provider():
     return OpenAI(api_key=key, base_url=base_url), default_model
 
 
-async def main_async(question, model, llm_client):
+async def carregar_divergencias(tool_source, execucao_id):
+    """Recupera todas as paginas e recusa uma listagem incompleta ou inconsistente."""
+    inicio, total, achados = 0, None, []
+    while True:
+        page = await tool_source.call("listar_divergencias", {"execucao_id": execucao_id, "inicio": inicio, "limite": 100})
+        if not isinstance(page, dict) or page.get("inicio") != inicio or not isinstance(page.get("total"), int) or not isinstance(page.get("divergencias"), list):
+            raise ToolExecutionError("pagina de divergencias invalida")
+        if total is None:
+            total = page["total"]
+        if page["total"] != total:
+            raise ToolExecutionError("total de divergencias mudou durante a leitura")
+        items = page["divergencias"]
+        achados.extend(items)
+        proximo = page.get("proximo_inicio")
+        if proximo is None:
+            if len(achados) != total:
+                raise ToolExecutionError("listagem incompleta de divergencias")
+            return achados
+        if not items or proximo != inicio + len(items) or proximo >= total:
+            raise ToolExecutionError("paginacao de divergencias invalida")
+        inicio = proximo
+
+
+def formatar_divergencias(execucao_id, achados):
+    categorias = {
+        "value_mismatch": "Diferença de valor", "date_mismatch": "Diferença de data/hora",
+        "status_mismatch": "Diferença de status", "duplicate": "Duplicidade — revisão manual",
+        "manual_review": "Revisão manual", "only_in_bank": "Somente no banco",
+        "only_in_csv": "Somente no CSV",
+    }
+    grupos = {}
+    for item in achados:
+        grupos.setdefault(item["type"], []).append(item)
+    linhas = [f"LISTA COMPLETA DE DIVERGÊNCIAS — execução {execucao_id}", f"Total: {len(achados)}", ""]
+    for categoria, itens in grupos.items():
+        linhas.append(f"{categorias.get(categoria, categoria)} ({len(itens)})")
+        for item in itens:
+            linhas.append(f"  Achado: {item['finding_id']} | NSU: {item.get('nsu') or '(sem NSU)'}")
+            linhas.append(f"  Detalhe: {item.get('detail', '')}")
+            for lado, rotulo in (("bank", "Banco"), ("csv", "CSV")):
+                dados = item.get(lado)
+                registros = dados if isinstance(dados, list) else ([dados] if dados else [])
+                if not registros:
+                    linhas.append(f"  {rotulo}: sem registro nesta evidência")
+                for registro in registros:
+                    valor = registro.get("amount_cents")
+                    linhas.append(f"  {rotulo}: NSU {registro.get('nsu') or '(sem NSU)'} | {registro.get('merchant', '')} | {valor} centavos | {registro.get('status', '')} | {registro.get('occurred_at', '')} | cartão {registro.get('card_last4', '')}")
+            linhas.append("")
+    if not achados:
+        linhas.append("Nenhuma divergência encontrada.")
+    return "\n".join(linhas)
+
+
+async def main_async(question, model, llm_client, exibir_metricas=True, listar_todas=False):
     project_dir = Path(__file__).resolve().parent.parent
     async with McpTools(project_dir) as tools:
-        result = await FinReconAgent(llm_client, tools, model).run(question)
+        agent = FinReconAgent(llm_client, tools, model)
+        result = await agent.run(question)
+        listagens = []
+        if listar_todas:
+            for execucao_id in agent.executions:
+                try:
+                    listagens.append(formatar_divergencias(execucao_id, await carregar_divergencias(tools, execucao_id)))
+                except (ToolExecutionError, KeyError, TypeError, ValueError):
+                    listagens.append(f"ATENÇÃO: não foi possível carregar a lista completa da execução {execucao_id}. Não considere o resumo como lista completa.")
     print(result.answer)
+    for listagem in listagens:
+        print("\n" + listagem)
+    if not exibir_metricas:
+        return
     print(f"\n[FinRecon AI: {len(result.tool_calls)} chamada(s) MCP | modelo: {result.model_ms} ms | MCP: {result.mcp_ms} ms | total: {result.elapsed_ms} ms]")
     usage = result.usage
     print(f"[Tokens: chamadas ao modelo: {usage.model_calls} | uso informado: {usage.reported_calls}/{usage.model_calls} | entrada: {usage.input_tokens} | saida: {usage.output_tokens} | raciocinio: {usage.thinking_tokens} | cache (incluido na entrada): {usage.cached_tokens} | total: {usage.total_tokens}]")
@@ -292,6 +363,8 @@ def main():
     parser = argparse.ArgumentParser(description="Agente FinRecon AI com MCP local")
     parser.add_argument("pergunta", help="Pedido em linguagem natural")
     parser.add_argument("--model", default=os.environ.get("FINRECON_MODEL"))
+    parser.add_argument("--sem-metricas", action="store_true", help="Exibe apenas a resposta, sem tempo, tokens ou custo")
+    parser.add_argument("--listar-todas", action="store_true", help="Exibe a lista completa de divergencias das conciliacoes executadas")
     args = parser.parse_args()
     try:
         client, default_model = build_provider()
@@ -300,7 +373,7 @@ def main():
     if not args.model and not default_model:
         parser.error("defina FINRECON_MODEL para este provedor")
     try:
-        asyncio.run(main_async(args.pergunta, args.model or default_model, client))
+        asyncio.run(main_async(args.pergunta, args.model or default_model, client, exibir_metricas=not args.sem_metricas, listar_todas=args.listar_todas))
     except Exception as exc:
         status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
         if status_code == 404:

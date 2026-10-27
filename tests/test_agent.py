@@ -6,8 +6,30 @@ from types import SimpleNamespace
 
 import pytest
 
-from conciliacao.agent import FinReconAgent, McpTools, TokenUsage, ToolExecutionError, build_provider, tools_for_openai
+from conciliacao.agent import FinReconAgent, McpTools, TokenUsage, ToolExecutionError, build_provider, carregar_divergencias, formatar_divergencias, tools_for_openai
 from conciliacao.generator import generate
+
+
+def test_cli_can_hide_metrics_without_hiding_financial_answer(monkeypatch, capsys):
+    from conciliacao import agent
+
+    class Tools:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class Agent:
+        async def run(self, question):
+            return agent.AgentResult("Foram identificadas 5 divergências.", ["conciliar"], 100, 90, 10, TokenUsage())
+
+    monkeypatch.setattr(agent, "McpTools", lambda project_dir: Tools())
+    monkeypatch.setattr(agent, "FinReconAgent", lambda client, tools, model: Agent())
+    asyncio.run(agent.main_async("Concilie", "teste", object(), exibir_metricas=False))
+    saida = capsys.readouterr().out
+    assert saida.strip() == "Foram identificadas 5 divergências."
+    assert "Tokens" not in saida and "Estimativa" not in saida
 
 
 class FakeTools:
@@ -111,6 +133,34 @@ def test_usage_missing_from_one_model_call_is_not_priced_as_zero():
     assert usage.gemini_standard_uncached_usd("gemini-3.5-flash-lite") is None
 
 
+def test_load_all_findings_across_multiple_pages_and_format_every_record():
+    items = [{"type": "duplicate", "finding_id": f"finding-{i}", "nsu": str(i), "detail": "revisar", "bank": [{"nsu": str(i), "amount_cents": i}, {"nsu": str(i), "amount_cents": i + 1}], "csv": None} for i in range(205)]
+
+    class Pages:
+        async def call(self, name, args):
+            start, limit = args["inicio"], args["limite"]
+            page = items[start:start + limit]
+            next_start = start + len(page)
+            return {"total": len(items), "inicio": start, "divergencias": page, "proximo_inicio": next_start if next_start < len(items) else None}
+
+    loaded = asyncio.run(carregar_divergencias(Pages(), "run-id"))
+    result = formatar_divergencias("run-id", loaded)
+    assert len(loaded) == 205
+    assert "Total: 205" in result
+    assert "finding-0" in result and "finding-204" in result
+    assert result.count("  Achado:") == 205
+    assert result.count("  Banco:") == 410
+
+
+def test_load_findings_rejects_incomplete_last_page():
+    class Incomplete:
+        async def call(self, name, args):
+            return {"total": 2, "inicio": 0, "divergencias": [{}], "proximo_inicio": None}
+
+    with pytest.raises(ToolExecutionError, match="incompleta"):
+        asyncio.run(carregar_divergencias(Incomplete(), "run-id"))
+
+
 def test_openai_usage_is_counted_without_double_counting_reasoning():
     usage = TokenUsage()
     usage.add_openai(SimpleNamespace(prompt_tokens=50, completion_tokens=20, total_tokens=70, prompt_tokens_details=SimpleNamespace(cached_tokens=10)))
@@ -142,6 +192,7 @@ def test_agent_uses_real_mcp_with_synthetic_data(tmp_path, monkeypatch):
         client = FakeGemini()
         async with McpTools(__import__("pathlib").Path(__file__).resolve().parent.parent) as tools:
             result = await FinReconAgent(client, tools, model="simulado").run("Concilie o arquivo")
+            assert len(await carregar_divergencias(tools, client.result["result"]["execucao_id"])) == 6
         assert result.tool_calls == ["conciliar"]
         assert client.result["ok"] is True
         assert client.result["result"]["summary"]["divergence_count"] == 6

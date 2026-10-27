@@ -18,7 +18,7 @@ def configure_server(tmp_path, monkeypatch):
 
 def test_server_registers_the_expected_mcp_tools():
     assert set(server.mcp._tool_manager._tools) == {
-        "listar_schema", "consultar_transacoes", "ler_csv", "conciliar", "detalhar_divergencia", "gerar_relatorio"
+        "listar_schema", "consultar_transacoes", "ler_csv", "conciliar", "listar_divergencias", "detalhar_divergencia", "gerar_relatorio"
     }
     detail_schema = server.mcp._tool_manager._tools["detalhar_divergencia"].parameters
     assert detail_schema["required"] == ["execucao_id", "finding_id"]
@@ -57,3 +57,19 @@ def test_run_id_is_deterministic_and_detail_uses_finding_id(tmp_path, monkeypatc
     assert server.detalhar_divergencia(execucao_id=first["execucao_id"], finding_id=finding)["finding_id"] == finding
     run = json.loads((server.RUNS_DIR / f"{first['execucao_id']}.json").read_text(encoding="utf-8"))
     assert run["metadata"]["rules_version"] == server.RULES_VERSION
+
+
+def test_paginated_findings_return_every_item_and_reject_invalid_limits(tmp_path, monkeypatch):
+    configure_server(tmp_path, monkeypatch)
+    run_id = server.conciliar(arquivo_csv="bandeira.csv", data="2026-10-19")["execucao_id"]
+    first = server.listar_divergencias(execucao_id=run_id, inicio=0, limite=2)
+    second = server.listar_divergencias(execucao_id=run_id, inicio=first["proximo_inicio"], limite=2)
+    third = server.listar_divergencias(execucao_id=run_id, inicio=second["proximo_inicio"], limite=2)
+    all_items = first["divergencias"] + second["divergencias"] + third["divergencias"]
+    assert first["total"] == 6 and len(all_items) == 6
+    assert third["proximo_inicio"] is None
+    assert len({item["finding_id"] for item in all_items}) == 6
+    with pytest.raises(ValueError):
+        server.listar_divergencias(execucao_id=run_id, inicio=-1)
+    with pytest.raises(ValueError):
+        server.listar_divergencias(execucao_id=run_id, limite=101)
