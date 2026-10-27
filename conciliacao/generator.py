@@ -6,6 +6,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import engine
+
 MERCHANTS = ["PADARIA SAO JORGE", "MERCADO CENTRAL", "POSTO IPIRANGA", "FARMACIA POPULAR", "UBER TRIP", "IFOOD", "NETFLIX", "SPOTIFY", "AMAZON BR", "MAGAZINE LUIZA", "RESTAURANTE SABOR", "LIVRARIA CULTURA", "CINEMARK", "DROGASIL", "AMERICANAS"]
 LOCAL_TZ = timezone(timedelta(hours=-3))
 SCHEMA = """
@@ -116,6 +118,20 @@ def generate(db_path, csv_path, truth_path, n=2000, per_type=10, benign=10, seed
         writer = csv.DictWriter(fh, fieldnames=CSV_HEADER, delimiter=";")
         writer.writeheader()
         writer.writerows(all_csv)
+    # Record the expected source evidence independently of the reconciliation result.
+    for expected in truth:
+        nsu = expected["nsu"]
+        expected["bank"] = [
+            engine.Tx("bank", t["nsu"], engine.norm_merchant(t["merchant"]), t["amount_cents"],
+                      t["occurred_at"], engine.norm_status(t["status"]), t["card_last4"]).to_dict()
+            for t in bank_rows if t["nsu"] == nsu
+        ]
+        expected["csv"] = [
+            engine.Tx("csv", row["nsu"], engine.norm_merchant(row["estabelecimento"]),
+                      engine.parse_amount(row["valor"]), engine.parse_dt(row["data_hora"]),
+                      engine.norm_status(row["situacao"]), row["final_cartao"]).to_dict()
+            for row in all_csv if row["nsu"] == nsu
+        ]
     Path(truth_path).write_text(json.dumps(sorted(truth, key=lambda t: (t["type"], t["nsu"])), indent=2), encoding="utf-8")
     return {"bank_rows": len(bank_rows), "csv_rows": len(all_csv), "injected": len(truth), "day": day}
 

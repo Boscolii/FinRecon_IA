@@ -179,20 +179,28 @@ def _compare(bank, other, tol_cents, tol_minutes):
 
 def reconcile(bank, csv_rows, tol_cents=0, tol_minutes=5):
     tol_cents, tol_minutes = _nonnegative_int("tolerancia_centavos", tol_cents, MAX_TOL_CENTS), _nonnegative_int("tolerancia_minutos", tol_minutes, MAX_TOL_MINUTES)
-    divergences, pairs = [], []
+    divergences, pairs, duplicate_bank = [], [], []
     bank_by_nsu, csv_by_nsu = _group([t for t in bank if t.nsu], lambda t: t.nsu), _group([t for t in csv_rows if t.nsu], lambda t: t.nsu)
     bank_left, csv_left, csv_unmatched_id = [t for t in bank if not t.nsu], [t for t in csv_rows if not t.nsu], []
     for nsu in sorted(set(bank_by_nsu) | set(csv_by_nsu)):
         b_rows, c_rows = bank_by_nsu.get(nsu, []), csv_by_nsu.get(nsu, [])
-        if len(b_rows) == len(c_rows) == 1:
-            pairs.append((b_rows[0], c_rows[0]))
-        elif b_rows and c_rows:
+        if len(b_rows) > 1 or len(c_rows) > 1:
             divergences.append(_divergence("duplicate", nsu, b_rows, c_rows, detail=f"NSU {nsu} nao e unico: {len(b_rows)} no banco e {len(c_rows)} no csv; revisao manual necessaria", group_key=nsu))
+            duplicate_bank.extend(b_rows)
+        elif len(b_rows) == len(c_rows) == 1:
+            pairs.append((b_rows[0], c_rows[0]))
         elif b_rows:
             bank_left.extend(b_rows)
         else:
             csv_unmatched_id.extend(c_rows)
-    b_groups, c_groups = _group(bank_left, lambda t: (t.merchant, t.card_last4)), _group(csv_left, lambda t: (t.merchant, t.card_last4))
+    remaining_csv = []
+    for tx in csv_left:
+        candidates = [b for b in duplicate_bank if (b.merchant, b.card_last4) == (tx.merchant, tx.card_last4) and abs(b.occurred_at - tx.occurred_at) <= COMPOSITE_WINDOW]
+        if candidates:
+            divergences.append(_divergence("manual_review", "", candidates, [tx], detail="CSV sem NSU pode corresponder a grupo duplicado no banco; revisao manual necessaria"))
+        else:
+            remaining_csv.append(tx)
+    b_groups, c_groups = _group(bank_left, lambda t: (t.merchant, t.card_last4)), _group(remaining_csv, lambda t: (t.merchant, t.card_last4))
     unmatched_bank, unmatched_csv = [], list(csv_unmatched_id)
     for key in sorted(set(b_groups) | set(c_groups)):
         b_rows, c_rows = b_groups.get(key, []), c_groups.get(key, [])

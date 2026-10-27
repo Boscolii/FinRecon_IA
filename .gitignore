@@ -5,3 +5,4 @@ data/
 logs/
 runs/
 .pytest_cache/
+tmp/

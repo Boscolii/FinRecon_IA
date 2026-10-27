@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,25 @@ def test_duplicate_nsu_on_both_sides_is_one_unpaired_group():
     assert kinds(result) == ["duplicate"]
     assert result["summary"]["matched_pairs"] == 0
     assert result["summary"]["only_in_bank_gross_cents"] == 0
+    assert result["summary"]["only_in_csv_gross_cents"] == 0
+
+
+def test_duplicate_only_in_bank_is_not_paired_with_csv_without_nsu():
+    result = engine.reconcile([tx("bank"), tx("bank"), tx("bank")], [tx("csv", nsu="")])
+    assert kinds(result) == ["duplicate", "manual_review"]
+    duplicate = next(d for d in result["divergences"] if d.type == "duplicate")
+    assert len(duplicate.bank) == 3
+    assert duplicate.csv is None
+    assert result["summary"]["matched_pairs"] == 0
+    assert result["summary"]["only_in_bank_gross_cents"] == 0
+    assert result["summary"]["only_in_csv_gross_cents"] == 0
+
+
+def test_duplicate_only_in_csv_is_reviewed_as_one_group():
+    result = engine.reconcile([], [tx("csv"), tx("csv"), tx("csv")])
+    assert kinds(result) == ["duplicate"]
+    assert len(result["divergences"][0].csv) == 3
+    assert result["divergences"][0].bank is None
     assert result["summary"]["only_in_csv_gross_cents"] == 0
 
 
@@ -162,6 +182,9 @@ def test_synthetic_dataset_is_fully_recovered(tmp_path):
     assert metrics["overall"]["precision"] == 1.0
     assert metrics["overall"]["recall"] == 1.0
     assert metrics["overall"]["expected"] == 30
+    assert metrics["overall"]["true_positive"] == 30
+    assert metrics["overall"]["false_positive"] == 0
+    assert metrics["overall"]["false_negative"] == 0
 
 
 def test_evaluation_uses_individual_finding_ids(tmp_path):
@@ -169,6 +192,23 @@ def test_evaluation_uses_individual_finding_ids(tmp_path):
     generate(db, csv_path, truth, n=100, per_type=2, benign=2, seed=11)
     entries = __import__("json").loads(Path(truth).read_text(encoding="utf-8"))
     assert all("finding_id" in item for item in entries)
+
+
+def test_evaluation_rejects_wrong_evidence_with_same_type_and_nsu(tmp_path, monkeypatch):
+    db, csv_path, truth = tmp_path / "b.db", tmp_path / "c.csv", tmp_path / "t.json"
+    generate(db, csv_path, truth, n=100, per_type=2, benign=2, seed=11)
+    real_reconcile = engine.reconcile
+
+    def incorrect_reconcile(*args, **kwargs):
+        result = real_reconcile(*args, **kwargs)
+        index = next(i for i, item in enumerate(result["divergences"]) if item.type == "value_mismatch")
+        finding = result["divergences"][index]
+        result["divergences"][index] = replace(finding, csv={**finding.csv, "amount_cents": finding.csv["amount_cents"] + 1})
+        return result
+
+    monkeypatch.setattr(engine, "reconcile", incorrect_reconcile)
+    metrics = evaluate(db, csv_path, truth, "2026-10-19")["value_mismatch"]
+    assert (metrics["true_positive"], metrics["false_positive"], metrics["false_negative"]) == (1, 1, 1)
 
 
 def test_bank_connection_is_read_only(tmp_path):

@@ -4,18 +4,33 @@ Servidor MCP que expõe ferramentas determinísticas de conciliação entre um b
 
 ## Princípio de design
 
-O LLM nunca compara nem soma valores. Ele interpreta o pedido, chama as ferramentas, resume o resultado e sugere hipóteses. Cada divergência traz os dois lados (IDs e valores), então qualquer resultado é verificável sem confiar no modelo.
+O motor, e não o LLM, é responsável por comparar e somar valores. O agente é instruído a interpretar o pedido, chamar ferramentas e explicar os resultados; uma resposta de modelo pode errar e deve ser conferida com a evidência determinística. As divergências incluem os registros disponíveis de cada fonte e um identificador do achado; quando um registro está ausente, não há evidência do outro lado.
 
-## Como rodar
+## Como rodar no Windows (PowerShell)
 
-```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python -m conciliacao.generator
-python -m conciliacao.evaluate
-pytest
-python -m conciliacao.server
+Na pasta do projeto, crie o ambiente virtual e instale as dependências. Este procedimento foi verificado no Windows com Python 3.14.6:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pytest
 ```
+
+Crie dados exclusivamente sintéticos em uma pasta **nova** e avalie o motor:
+
+```powershell
+.\.venv\Scripts\python.exe -m conciliacao.generator --out dados-demo --seed 7
+.\.venv\Scripts\python.exe -m conciliacao.evaluate --data dados-demo --day 2026-10-19
+```
+
+O gerador substitui `banco.db`, `bandeira.csv` e `gabarito.json` se já existirem no destino. Escolha uma pasta nova para preservar seus dados. Para executar o agente nessa pasta, configure-a no mesmo terminal:
+
+```powershell
+$env:CONCILIACAO_DATA_DIR = 'dados-demo'
+$env:CONCILIACAO_DB = 'dados-demo/banco.db'
+```
+
+Para iniciar somente o servidor MCP, use `.\.venv\Scripts\python.exe -m conciliacao.server`. Ele se comunica pelo protocolo MCP via entrada e saída padrão; não é uma interface de chat no terminal.
 
 ## Agente de IA
 
@@ -27,7 +42,7 @@ No PowerShell:
 
 ```powershell
 $env:GEMINI_API_KEY = "sua_chave"
-python -m conciliacao.agent "Concilie o arquivo bandeira.csv do dia 2026-10-19 e explique as divergencias."
+.\.venv\Scripts\python.exe -m conciliacao.agent "Concilie o arquivo bandeira.csv do dia 2026-10-19 e explique as divergencias."
 ```
 
 O agente pode chamar somente `listar_schema`, `consultar_transacoes`, `ler_csv`, `conciliar`, `detalhar_divergencia` e `gerar_relatorio`. O limite é oito rodadas de ferramentas por pergunta. Em caso de erro de ferramenta, ele recebe a falha estruturada e deve informar a limitação, sem inventar um resultado. Um provedor que não ofereça tool calling precisa de um adaptador próprio e não deve ser usado para a demonstração do agente.
@@ -61,7 +76,7 @@ Pedido de exemplo: "Concilie o arquivo bandeira.csv do dia 2026-10-19 com o banc
 
 ## Matching
 
-1. Match exato por NSU somente quando a referência é única nos dois lados. Qualquer repetição vira um grupo `duplicate` para investigação, sem pareamento arbitrário.
+1. Match exato por NSU somente quando a referência é única nos dois lados. Qualquer repetição, mesmo presente em apenas uma fonte, vira um grupo `duplicate` para investigação, sem pareamento arbitrário. Um candidato do CSV sem NSU ligado a um grupo duplicado do banco também vai para revisão manual.
 2. Para linhas do CSV sem NSU, candidatos usam estabelecimento normalizado, final do cartão e janela de 24h; valor é comparado depois do pareamento.
 3. Mais de um candidato composto vira `manual_review`, nunca um palpite.
 4. Pares encontrados são comparados em valor (centavos), status e horário. O dia de negócio é America/Sao_Paulo e timestamps precisam incluir fuso.
@@ -72,7 +87,7 @@ Tipos: `value_mismatch`, `only_in_bank`, `only_in_csv`, `duplicate`, `date_misma
 
 - Banco aberto com `mode=ro`; não existe ferramenta de escrita.
 - Nenhum SQL livre vindo do LLM: só consultas parametrizadas.
-- CSV só é lido diretamente dentro de `data/`, com extensão `.csv`; caminhos relativos, subpastas e links simbólicos são bloqueados.
+- CSV só é lido diretamente dentro da pasta de dados configurada (`data/` por padrão), com extensão `.csv`; travessia de diretórios, subpastas e links simbólicos são bloqueados.
 - Cada CSV é limitado a 10 MiB e 100.000 linhas. Pré-visualizações e consultas têm limite explícito de 500 registros.
 - Cada chamada gera uma linha em `logs/audit.jsonl` (parâmetros, status, duração).
 - `execucao_id` usa o hash SHA-256 completo do CSV, registros do banco, parâmetros e versão das regras; a execução salva metadados de reprodução em `runs/`.
@@ -83,7 +98,10 @@ O CSV usa UTF-8 (BOM aceito), delimitador `;` e exatamente as colunas listadas e
 
 ## Avaliação
 
-`generator` cria 2.000 transações, injeta 10 divergências de cada tipo (60 no total) e grava o gabarito com um identificador por achado. Também cria 10 linhas do CSV sem NSU que devem ser conciliadas pela chave composta sem gerar alerta. `evaluate` mede precisão e recall por tipo; quando não houver previsões ou exemplos, a métrica é indefinida (`null`), e não 100%.
+Consulte [o roteiro de demonstração e testes](docs/roteiro-demonstracao.md) para reproduzir os dados sintéticos, executar a avaliação e entender suas limitações.
+Para preparar sua explicação, consulte também o [guia para a entrevista](docs/guia-entrevista.md).
+
+`generator` cria 2.000 transações, injeta 10 divergências de cada tipo (60 no total) e grava no gabarito as evidências esperadas de cada fonte. Também cria 10 linhas do CSV sem NSU que devem ser conciliadas pela chave composta sem gerar alerta. `evaluate` compara o tipo e as evidências, preservando a multiplicidade, e mede precisão e recall por tipo; quando não houver previsões ou exemplos, a métrica é indefinida (`null`), e não 100%. Gabaritos anteriores, sem evidências, precisam ser gerados novamente em uma pasta separada.
 
 Resultado atual no dataset sintético (seed 7): precisão 100% e recall 100%. O dataset é sintético e as regras são as mesmas que geraram os erros, então isso valida a implementação e não prova desempenho em dados reais.
 
@@ -95,6 +113,6 @@ Resultado atual no dataset sintético (seed 7): precisão 100% e recall 100%. O 
 
 ## Próximos passos
 
-- Cliente do agente (LLM) chamando as ferramentas, e experimento A (LLM compara valores) vs. B (ferramentas determinísticas) para medir erros.
-- Baseline manual cronometrado (SQL + planilha) para o slide de resultado.
-- Casos mais difíceis no gerador (estorno parcial, parcelas, arredondamento).
+- Repetir medições do agente e o teste manual sob condições comparáveis; medir também tokens e custo real.
+- Adicionar identificadores individuais de origem e casos de avaliação independentes para dados sem NSU, ambiguidades e anomalias combinadas.
+- Expandir regras financeiras apenas após definir requisitos, por exemplo para estornos parciais e parcelamento.

@@ -1,10 +1,12 @@
 import asyncio
 import json
+import copy
 from types import SimpleNamespace
 
 import pytest
 
-from conciliacao.agent import FinReconAgent, ToolExecutionError, build_provider, tools_for_openai
+from conciliacao.agent import FinReconAgent, McpTools, ToolExecutionError, build_provider, tools_for_openai
+from conciliacao.generator import generate
 
 
 class FakeTools:
@@ -22,7 +24,7 @@ class FakeCompletions:
         self.requests = []
 
     def create(self, **kwargs):
-        self.requests.append(kwargs)
+        self.requests.append(copy.deepcopy(kwargs))
         if len(self.requests) == 1:
             call = SimpleNamespace(function=SimpleNamespace(name="conciliar", arguments='{"arquivo_csv":"bandeira.csv"}'), id="call_1")
             message = SimpleNamespace(tool_calls=[call], content=None, model_dump=lambda **kwargs: {"role": "assistant", "tool_calls": []})
@@ -63,9 +65,63 @@ def test_provider_configuration_supports_gemini_openai_and_compatible(monkeypatc
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     _, model = build_provider()
-    assert model == "gemini-2.5-flash"
+    assert model == "gemini-3.5-flash-lite"
     monkeypatch.setenv("LLM_PROVIDER", "openai_compatible")
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("LLM_BASE_URL", "https://example.test/v1")
     _, model = build_provider()
     assert model is None
+
+
+def test_gemini_tool_result_is_returned_to_model():
+    class FakeGemini:
+        kind = "gemini_native"
+
+        def __init__(self):
+            self.requests = []
+
+        def create(self, model, contents, tools):
+            self.requests.append(copy.deepcopy(contents))
+            if len(self.requests) == 1:
+                return {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "conciliar", "args": {"arquivo_csv": "bandeira.csv"}, "id": "call-1"}, "thoughtSignature": "signature"}]}}]}
+            return {"candidates": [{"content": {"parts": [{"text": "Foram encontradas 2 divergencias."}]}}]}
+
+    client = FakeGemini()
+    result = asyncio.run(FinReconAgent(client, FakeTools(), model="test-model").run("Concilie bandeira.csv"))
+    assert result.answer == "Foram encontradas 2 divergencias."
+    assert client.requests[1][1]["parts"][0]["thoughtSignature"] == "signature"
+    output = client.requests[1][-1]["parts"][0]["functionResponse"]
+    assert output["id"] == "call-1"
+    assert output["response"]["result"]["summary"]["divergence_count"] == 2
+
+
+def test_agent_uses_real_mcp_with_synthetic_data(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    generate(data / "banco.db", data / "bandeira.csv", data / "gabarito.json", n=40, per_type=1, benign=1, seed=3)
+    monkeypatch.setenv("CONCILIACAO_DATA_DIR", str(data))
+    monkeypatch.setenv("CONCILIACAO_DB", str(data / "banco.db"))
+    monkeypatch.setenv("CONCILIACAO_RUNS", str(tmp_path / "runs"))
+    monkeypatch.setenv("CONCILIACAO_LOG", str(tmp_path / "logs" / "audit.jsonl"))
+
+    class FakeGemini:
+        kind = "gemini_native"
+
+        def __init__(self):
+            self.result = None
+
+        def create(self, model, contents, tools):
+            if len(contents) == 1:
+                return {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "conciliar", "args": {"arquivo_csv": "bandeira.csv", "data": "2026-10-19"}}}]}}]}
+            self.result = contents[-1]["parts"][0]["functionResponse"]["response"]
+            return {"candidates": [{"content": {"parts": [{"text": "Conciliacao concluida."}]}}]}
+
+    async def run():
+        client = FakeGemini()
+        async with McpTools(__import__("pathlib").Path(__file__).resolve().parent.parent) as tools:
+            result = await FinReconAgent(client, tools, model="simulado").run("Concilie o arquivo")
+        assert result.tool_calls == ["conciliar"]
+        assert client.result["ok"] is True
+        assert client.result["result"]["summary"]["divergence_count"] == 6
+        assert len(client.result["result"]["execucao_id"]) == 64
+
+    asyncio.run(run())
