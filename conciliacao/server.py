@@ -19,7 +19,7 @@ PREVIEW_DIVERGENCES = 25
 MAX_CSV_BYTES = 10 * 1024 * 1024
 MAX_CSV_LINES = 100_000
 MAX_REPORT_ITEMS = 50
-RULES_VERSION = "2026-10-27.3"
+RULES_VERSION = "2026-10-27.8"
 RUN_FORMAT_VERSION = 2
 
 mcp = FastMCP("FinRecon AI")
@@ -112,15 +112,15 @@ def consultar_transacoes(data_inicio: str, data_fim: str, limite: int = 50) -> d
     if start >= end:
         raise ValueError("data_inicio deve ser anterior ou igual a data_fim")
     limit = _limit(limite, "limite", MAX_ROWS)
-    params = (start.isoformat(), end.isoformat())
     conn = engine.connect_readonly(DB_PATH)
     try:
-        total = conn.execute("SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM transactions WHERE occurred_at >= ? AND occurred_at < ?", params).fetchone()
-        rows = conn.execute("SELECT nsu, merchant, amount_cents, occurred_at, status, card_last4 FROM transactions WHERE occurred_at >= ? AND occurred_at < ? ORDER BY id LIMIT ?", (*params, limit)).fetchall()
+        transactions = engine.load_bank(conn, start, end)
     finally:
         conn.close()
-    keys = ("nsu", "merchant", "amount_cents", "occurred_at", "status", "card_last4")
-    return {"total": total[0], "soma_centavos": total[1], "retornadas": len(rows), "transacoes": [dict(zip(keys, r)) for r in rows]}
+    rows = [tx.to_dict() for tx in transactions[:limit]]
+    for row in rows:
+        row.pop("source")
+    return {"total": len(transactions), "soma_centavos": sum(tx.amount_cents for tx in transactions), "retornadas": len(rows), "transacoes": rows}
 
 
 @mcp.tool()
@@ -136,28 +136,32 @@ def ler_csv(arquivo: str, limite: int = 20) -> dict:
 def conciliar(arquivo_csv: str, data: str, tolerancia_centavos: int = 0, tolerancia_minutos: int = 5, margem_dias: int = 1) -> dict:
     path = _safe_csv(arquivo_csv)
     start, end = engine.day_window(data, margem_dias)
+    target_window = engine.day_window(data)
+    csv_bytes = path.read_bytes()
+    if len(csv_bytes) > MAX_CSV_BYTES or csv_bytes.count(b"\n") > MAX_CSV_LINES:
+        raise ValueError("arquivo csv excede o limite de tamanho ou linhas")
     conn = engine.connect_readonly(DB_PATH)
     try:
         bank = engine.load_bank(conn, start, end)
     finally:
         conn.close()
-    csv_rows = engine.load_csv(path, start, end)
-    result = engine.reconcile(bank, csv_rows, tolerancia_centavos, tolerancia_minutos)
+    csv_rows = engine.load_csv(csv_bytes, start, end)
+    result = engine.reconcile(bank, csv_rows, tolerancia_centavos, tolerancia_minutos, target_window=target_window)
     digest = hashlib.sha256()
-    digest.update(path.read_bytes())
+    digest.update(csv_bytes)
     digest.update(json.dumps({"rules_version": RULES_VERSION, "data": data, "tolerancia_centavos": tolerancia_centavos, "tolerancia_minutos": tolerancia_minutos, "margem_dias": margem_dias, "bank": [t.to_dict() for t in bank]}, sort_keys=True).encode())
     run_id = digest.hexdigest()
     run = {
         "execucao_id": run_id,
         "parametros": {"arquivo_csv": arquivo_csv, "data": data, "tolerancia_centavos": tolerancia_centavos, "tolerancia_minutos": tolerancia_minutos, "margem_dias": margem_dias},
-        "metadata": {"run_format_version": RUN_FORMAT_VERSION, "rules_version": RULES_VERSION, "csv_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bank_records": len(bank)},
+        "metadata": {"run_format_version": RUN_FORMAT_VERSION, "rules_version": RULES_VERSION, "csv_sha256": hashlib.sha256(csv_bytes).hexdigest(), "bank_records": len(bank), "janela_busca_utc": [start.isoformat(), end.isoformat()], "dia_negocio_utc": [dt.isoformat() for dt in target_window]},
         "summary": result["summary"],
         "divergences": [d.to_dict() for d in result["divergences"]],
     }
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     _run_path(run_id).write_text(json.dumps(run, ensure_ascii=False, indent=1), encoding="utf-8")
     preview = run["divergences"][:PREVIEW_DIVERGENCES]
-    return {"execucao_id": run_id, "summary": run["summary"], "divergences": preview, "truncado": len(run["divergences"]) > len(preview)}
+    return {"execucao_id": run_id, "periodo": {"data": data, "margem_dias": margem_dias, "explicacao": "Totais e achados incluem o dia solicitado; registros da margem aparecem apenas como candidatos ligados ao dia."}, "summary": run["summary"], "divergences": preview, "truncado": len(run["divergences"]) > len(preview)}
 
 
 @mcp.tool()
@@ -194,6 +198,7 @@ def gerar_relatorio(execucao_id: str, max_por_tipo: int = 10) -> str:
         f"# Relatorio de conciliacao {execucao_id}",
         "",
         f"- Arquivo: {p['arquivo_csv']} | Data: {p['data']} (margem de {p['margem_dias']} dia)",
+        "- Totais e achados referem-se ao dia solicitado; registros da margem podem aparecer como candidatos ligados ao dia.",
         f"- Tolerancias: {p['tolerancia_centavos']} centavos, {p['tolerancia_minutos']} minutos",
         f"- Banco: {s['bank_total']} | CSV: {s['csv_total']} | Pares conciliados: {s['matched_pairs']} ({s['clean_pairs']} sem divergencia)",
         f"- Divergencias: {s['divergence_count']} | Diferencas absolutas de valor em pares: {_brl(s['amount_difference_abs_cents'])}",

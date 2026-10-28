@@ -2,19 +2,40 @@
 
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, scrolledtext, ttk
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 EXAMPLE = "Concilie bandeira.csv no dia 2026-10-19 e explique as divergências."
+TEMPO_LIMITE_SEGUNDOS = 300
 
 
-def executar_agente(pergunta, pasta_dados):
+def _encerrar_processo(processo):
+    """Encerra o agente e seus filhos, incluindo o servidor MCP."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(processo.pid), "/T", "/F"],
+                           capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(processo.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if processo.poll() is None:
+        processo.kill()
+    processo.communicate()
+
+
+def executar_agente(pergunta, pasta_dados, cancelamento=None):
     """Executa o CLI sem shell e retorna a saída ou uma mensagem de erro."""
     pasta = Path(pasta_dados).expanduser().resolve()
     if not pergunta.strip():
@@ -30,19 +51,35 @@ def executar_agente(pergunta, pasta_dados):
         "CONCILIACAO_DB": str(pasta / "banco.db"),
         "PYTHONIOENCODING": "utf-8",
     })
-    resultado = subprocess.run(
+    opcoes_grupo = ({"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+                    if os.name == "nt" else {"start_new_session": True})
+    processo = subprocess.Popen(
         [sys.executable, "-m", "conciliacao.agent", "--sem-metricas", "--listar-todas", pergunta.strip()],
         cwd=PROJECT_DIR,
         env=ambiente,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **opcoes_grupo,
     )
-    if resultado.returncode:
-        return False, resultado.stderr.strip() or "Não foi possível executar o agente."
-    return True, resultado.stdout.strip() or "O agente não retornou uma resposta."
+    prazo = time.monotonic() + TEMPO_LIMITE_SEGUNDOS
+    while True:
+        if cancelamento is not None and cancelamento.is_set():
+            _encerrar_processo(processo)
+            return False, "Consulta cancelada."
+        if time.monotonic() >= prazo:
+            _encerrar_processo(processo)
+            return False, "A consulta ultrapassou o tempo limite de 5 minutos. Tente novamente."
+        try:
+            saida, erro = processo.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    if processo.returncode:
+        return False, erro.strip() or "Não foi possível executar o agente."
+    return True, saida.strip() or "O agente não retornou uma resposta."
 
 
 class Interface:
@@ -50,6 +87,8 @@ class Interface:
         self.janela = janela
         self.resultados = queue.Queue()
         self.em_execucao = False
+        self.cancelamento = threading.Event()
+        self.fechando = False
         janela.title("FinRecon AI")
         janela.geometry("850x650")
         janela.minsize(600, 450)
@@ -76,6 +115,8 @@ class Interface:
         linha_acao.pack(fill="x")
         self.botao = ttk.Button(linha_acao, text="Enviar pergunta", command=self.enviar)
         self.botao.pack(side="left")
+        self.botao_cancelar = ttk.Button(linha_acao, text="Cancelar consulta", command=self.cancelar, state="disabled")
+        self.botao_cancelar.pack(side="left", padx=(8, 0))
         self.estado = tk.StringVar(value="Pronto. Cada pergunta inicia uma nova consulta.")
         ttk.Label(linha_acao, textvariable=self.estado).pack(side="left", padx=12)
 
@@ -102,14 +143,16 @@ class Interface:
         pergunta = self.pergunta.get("1.0", "end").strip()
         pasta = self.pasta.get().strip()
         self.em_execucao = True
+        self.cancelamento.clear()
         self.botao.configure(state="disabled")
+        self.botao_cancelar.configure(state="normal")
         self.estado.set("Consultando... Aguarde a resposta.")
         self.exibir("Consultando o agente e as ferramentas MCP...")
 
         def executar():
             try:
-                self.resultados.put(executar_agente(pergunta, pasta))
-            except (OSError, ValueError) as exc:
+                self.resultados.put(executar_agente(pergunta, pasta, self.cancelamento))
+            except Exception as exc:
                 self.resultados.put((False, str(exc)))
 
         threading.Thread(target=executar, daemon=True).start()
@@ -120,15 +163,26 @@ class Interface:
         except queue.Empty:
             pass
         else:
+            if self.fechando:
+                self.janela.destroy()
+                return
             self.exibir(texto)
             self.estado.set("Consulta concluída." if sucesso else "Não foi possível concluir a consulta.")
             self.em_execucao = False
             self.botao.configure(state="normal")
+            self.botao_cancelar.configure(state="disabled")
         self.janela.after(100, self.verificar_resultados)
+
+    def cancelar(self):
+        if self.em_execucao:
+            self.cancelamento.set()
+            self.botao_cancelar.configure(state="disabled")
+            self.estado.set("Cancelando consulta...")
 
     def fechar(self):
         if self.em_execucao:
-            messagebox.showinfo("Consulta em andamento", "Aguarde a consulta terminar antes de fechar a janela.")
+            self.fechando = True
+            self.cancelar()
             return
         self.janela.destroy()
 

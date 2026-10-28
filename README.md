@@ -8,54 +8,71 @@ O motor, e não o LLM, é responsável por comparar e somar valores. O agente é
 
 ## Como rodar no Windows (PowerShell)
 
-Na pasta do projeto, crie o ambiente virtual e instale as dependências. Este procedimento foi verificado no Windows com Python 3.14.6:
+O uso principal é pela interface gráfica. O PowerShell é necessário apenas para preparar o ambiente e abrir a janela. Este procedimento foi verificado no Windows com Python 3.14.6.
+
+### 1. Instale as dependências
+
+Na pasta do projeto, crie o ambiente virtual e instale as dependências:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest
 ```
 
-Crie dados exclusivamente sintéticos em uma pasta **nova** e avalie o motor:
+### 2. Configure a chave da API
+
+Se ainda não existir um arquivo `.env` na pasta do projeto, copie o exemplo e abra-o para edição:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Se o `.env` já existir, abra-o diretamente com `notepad .env`; não substitua sua configuração atual. Para usar Gemini, preencha `GEMINI_API_KEY` e mantenha `LLM_PROVIDER=gemini`. Salve o arquivo e nunca compartilhe sua chave ou envie o `.env` ao GitHub. O uso da API está sujeito à disponibilidade, aos limites e à cobrança do provedor.
+
+### 3. Prepare os dados sintéticos
+
+Crie os dados em uma pasta **nova**:
 
 ```powershell
 .\.venv\Scripts\python.exe -m conciliacao.generator --out dados-demo --seed 7
-.\.venv\Scripts\python.exe -m conciliacao.evaluate --data dados-demo --day 2026-10-19
 ```
 
-O gerador substitui `banco.db`, `bandeira.csv` e `gabarito.json` se já existirem no destino. Escolha uma pasta nova para preservar seus dados. Para executar o agente nessa pasta, configure-a no mesmo terminal:
+O gerador substitui `banco.db`, `bandeira.csv` e `gabarito.json` se já existirem no destino. Escolha uma pasta nova para preservar seus dados.
 
-```powershell
-$env:CONCILIACAO_DATA_DIR = 'dados-demo'
-$env:CONCILIACAO_DB = 'dados-demo/banco.db'
-```
-
-Para iniciar somente o servidor MCP, use `.\.venv\Scripts\python.exe -m conciliacao.server`. Ele se comunica pelo protocolo MCP via entrada e saída padrão; não é uma interface de chat no terminal.
-
-## Agente de IA
-
-### Janela simples
-
-Com as dependências instaladas e a chave configurada no `.env`, abra a interface local no Windows:
+### 4. Abra a interface
 
 ```powershell
 .\.venv\Scripts\python.exe -m conciliacao.interface
 ```
 
-Selecione a pasta que contém `banco.db` e o CSV sintético, escreva sua pergunta e clique em **Enviar pergunta**. Quando a consulta executar uma conciliação, a janela apresenta a explicação do agente seguida da lista completa de achados, agrupados por categoria, com as evidências retornadas pelo motor. Se a listagem não puder ser recuperada integralmente, a janela informa a falha. As métricas de tempo e tokens permanecem disponíveis no uso pelo terminal. A interface exige que o banco se chame `banco.db`; cada pergunta é uma consulta independente. O Python precisa ter Tkinter instalado.
+Na janela:
 
-### Uso pelo terminal
+- Clique em **Escolher pasta** e selecione `dados-demo`, ou outra pasta com `banco.db` e o CSV sintético.
+- Escreva sua pergunta, por exemplo: “Concilie bandeira.csv no dia 2026-10-19 e explique as divergências.”
+- Clique em **Enviar pergunta** e aguarde a resposta.
 
-O agente é um cliente de linha de comando que inicia o servidor MCP localmente, apresenta apenas as ferramentas permitidas ao modelo e devolve os resultados determinísticos para explicação. Ele não recebe acesso direto ao SQLite, ao sistema de arquivos ou a SQL livre.
+A janela apresenta a explicação do agente seguida da lista completa de achados por categoria, com as evidências do motor. Se não conseguir recuperar a lista inteira, informa a falha. Cada pergunta inicia uma consulta independente; o Python precisa ter Tkinter instalado.
 
-Crie um arquivo `.env` a partir de `.env.example` e configure o provedor. O padrão é Gemini, com `GEMINI_API_KEY`, modelo `gemini-3.5-flash-lite` e `GEMINI_THINKING_LEVEL=minimal`, perfil rápido para perguntas operacionais; também são aceitos `openai`, com `OPENAI_API_KEY`, e qualquer endpoint que implemente o padrão OpenAI Chat Completions/tool calling, por meio de `LLM_PROVIDER=openai_compatible`, `LLM_API_KEY` e `LLM_BASE_URL`. Nunca versione uma chave real. `FINRECON_MODEL` é opcional para Gemini e OpenAI, mas obrigatório para um endpoint compatível.
+Para interromper uma consulta, clique em **Cancelar consulta** ou feche a janela. A consulta também é interrompida se ultrapassar cinco minutos.
 
-No PowerShell:
+## Agente de IA
+
+O agente inicia o servidor MCP localmente, apresenta apenas as ferramentas permitidas ao modelo e devolve os resultados determinísticos para explicação. Ele não recebe acesso direto ao SQLite, ao sistema de arquivos ou a SQL livre.
+
+O padrão é Gemini, com `GEMINI_API_KEY`, modelo `gemini-3.5-flash-lite` e `GEMINI_THINKING_LEVEL=minimal`, perfil rápido para perguntas operacionais; também são aceitos `openai`, com `OPENAI_API_KEY`, e endpoints que implementem OpenAI Chat Completions/tool calling, com `LLM_PROVIDER=openai_compatible`, `LLM_API_KEY` e `LLM_BASE_URL`. `FINRECON_MODEL` é opcional para Gemini e OpenAI, mas obrigatório para um endpoint compatível.
+
+### Uso pelo terminal (opcional)
+
+Para usar o agente diretamente pelo PowerShell, configure a pasta de dados na sessão e informe a pergunta:
 
 ```powershell
-$env:GEMINI_API_KEY = "sua_chave"
+$env:CONCILIACAO_DATA_DIR = 'dados-demo'
+$env:CONCILIACAO_DB = 'dados-demo/banco.db'
 .\.venv\Scripts\python.exe -m conciliacao.agent "Concilie o arquivo bandeira.csv do dia 2026-10-19 e explique as divergencias."
 ```
+
+Para executar os testes, use `.\.venv\Scripts\python.exe -m pytest`. Para iniciar somente o servidor MCP, use `.\.venv\Scripts\python.exe -m conciliacao.server`. O servidor se comunica via entrada e saída padrão e não é uma interface de chat.
 
 O agente pode chamar somente `listar_schema`, `consultar_transacoes`, `ler_csv`, `conciliar`, `listar_divergencias`, `detalhar_divergencia` e `gerar_relatorio`. O limite é oito rodadas de ferramentas por pergunta. Em caso de erro de ferramenta, ele recebe a falha estruturada e deve informar a limitação, sem inventar um resultado. Um provedor que não ofereça tool calling precisa de um adaptador próprio e não deve ser usado para a demonstração do agente.
 
@@ -94,7 +111,11 @@ Pedido de exemplo: "Concilie o arquivo bandeira.csv do dia 2026-10-19 com o banc
 1. Match exato por NSU somente quando a referência é única nos dois lados. Qualquer repetição, mesmo presente em apenas uma fonte, vira um grupo `duplicate` para investigação, sem pareamento arbitrário. Um candidato do CSV sem NSU ligado a um grupo duplicado do banco também vai para revisão manual.
 2. Para linhas do CSV sem NSU, candidatos usam estabelecimento normalizado, final do cartão e janela de 24h; valor é comparado depois do pareamento.
 3. Mais de um candidato composto vira `manual_review`, nunca um palpite.
-4. Pares encontrados são comparados em valor (centavos), status e horário. O dia de negócio é America/Sao_Paulo e timestamps precisam incluir fuso.
+4. Pares encontrados são comparados em valor (centavos), status e horário. Em pares pelo NSU, diferenças de estabelecimento ou final do cartão exigem revisão manual. O dia de negócio é America/Sao_Paulo e timestamps precisam incluir fuso.
+
+Na busca composta, os horários são ordenados para localizar candidatos na janela de 24 horas. Grupos ambíguos são reunidos sem armazenar todas as combinações possíveis; os registros envolvidos continuam disponíveis como evidência para revisão.
+
+Por padrão, o motor também busca candidatos no dia anterior e no seguinte. Os totais contam os registros do dia solicitado; achados e pares são incluídos quando pelo menos um registro pertence a esse dia. Um registro da margem pode aparecer como evidência de um achado ligado ao dia, mas não aumenta o total de registros daquele lado. A margem pode ser configurada na ferramenta `conciliar`.
 
 Tipos: `value_mismatch`, `only_in_bank`, `only_in_csv`, `duplicate`, `date_mismatch`, `status_mismatch`, `manual_review`.
 
@@ -111,20 +132,15 @@ Tipos: `value_mismatch`, `only_in_bank`, `only_in_csv`, `duplicate`, `date_misma
 
 O CSV usa UTF-8 (BOM aceito), delimitador `;` e exatamente as colunas listadas em `listar_schema`. O arquivo inteiro é rejeitado quando houver cabeçalho inválido, coluna duplicada ou ausente, campo obrigatório vazio, valor/status inválido, cartão diferente de quatro dígitos ou data sem fuso. A mensagem lista os erros por linha; dados válidos não são processados parcialmente.
 
-## Avaliação
-
-Consulte [o roteiro de demonstração e testes](docs/roteiro-demonstracao.md) para reproduzir os dados sintéticos, executar a avaliação e entender suas limitações.
-Para preparar sua explicação, consulte também o [guia para a entrevista](docs/guia-entrevista.md).
-
-`generator` cria 2.000 transações, injeta 10 divergências de cada tipo (60 no total) e grava no gabarito as evidências esperadas de cada fonte. Também cria 10 linhas do CSV sem NSU que devem ser conciliadas pela chave composta sem gerar alerta. `evaluate` compara o tipo e as evidências, preservando a multiplicidade, e mede precisão e recall por tipo; quando não houver previsões ou exemplos, a métrica é indefinida (`null`), e não 100%. Gabaritos anteriores, sem evidências, precisam ser gerados novamente em uma pasta separada.
-
-Resultado atual no dataset sintético (seed 7): precisão 100% e recall 100%. O dataset é sintético e as regras são as mesmas que geraram os erros, então isso valida a implementação e não prova desempenho em dados reais.
+Valores aceitos incluem `1234,56`, `1.234,56`, `1234.56` e números inteiros; separadores mal posicionados são rejeitados.
+Os valores devem caber no intervalo inteiro de 64 bits em centavos do SQLite. No banco, `amount_cents` deve ser armazenado como inteiro; valores fracionários ou de outro tipo são rejeitados.
 
 ## Limitações conhecidas
 
 - Dados sintéticos; sem ruído real de bandeira (layouts diferentes, estornos parciais, parcelamento).
 - Matching composto ainda exige estabelecimento, cartão e proximidade temporal inequívocos; casos ambíguos exigem revisão manual.
-- Carrega o dia inteiro em memória; para volumes grandes seria preciso processar em lotes.
+- Para tratar timestamps com offsets diferentes corretamente, a leitura do banco examina todos os horários e mantém os registros selecionados em memória; volumes grandes exigem armazenamento UTC normalizado e consulta indexada ou processamento em lotes.
+- Os registros e evidências de cada execução ainda são mantidos em memória e gravados em JSON; arquivos e grupos muito grandes exigem medição e podem precisar de armazenamento e apresentação em lotes.
 
 ## Próximos passos
 
